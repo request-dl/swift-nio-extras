@@ -85,4 +85,49 @@ public enum SOCKSError: Sendable {
         }
     }
 
+    /// The server selected an authentication method that this client does not implement.
+    public struct UnsupportedAuthenticationMethod: Error, Hashable {
+        public var method: AuthenticationMethod
+        public init(method: AuthenticationMethod) {
+            self.method = method
+        }
+    }
+
+    /// The server rejected the username and password (RFC 1929). Any status other than *0*
+    /// is a rejection.
+    public struct AuthenticationFailed: Error, Hashable {
+        public var status: UInt8
+        public init(status: UInt8) {
+            self.status = status
+        }
+    }
+
+    /// The version of the username/password sub-negotiation was something other than *1*.
+    public struct InvalidSubnegotiationVersion: Error, Hashable {
+        public var actual: UInt8
+        public init(actual: UInt8) {
+            self.actual = actual
+        }
+    }
+
+    /// A username or password is empty, or longer than the 255 bytes RFC 1929 can encode.
+    public struct InvalidCredentialLength: Error, Hashable {
+        /// The part of the credentials that has an invalid length.
+        public enum Field: Hashable, Sendable {
+            case username
+            case password
+        }
+
+        /// Which part of the credentials is invalid.
+        public var field: Field
+
+        /// The length in bytes of the invalid value.
+        public var actual: Int
+
+        public init(field: Field, actual: Int) {
+            self.field = field
+            self.actual = actual
+        }
+    }
+
 }
