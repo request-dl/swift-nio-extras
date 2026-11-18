@@ -111,10 +111,13 @@ public class UsernamePasswordStateMachineTests: XCTestCase {
             XCTAssertEqual($0 as? SOCKSError.UnsupportedAuthenticationMethod, .init(method: .init(value: 0x80)))
         }
 
-        var none = try self.clientStateMachineAwaitingMethod(offering: [.noneRequired, .noneAcceptable])
-        var noneSelection = ByteBuffer(bytes: [0x05, 0xFF])
-        XCTAssertThrowsError(try none.receiveBuffer(&noneSelection)) {
-            XCTAssertTrue($0 is SOCKSError.NoValidAuthenticationMethod)
+        // 0xFF means "no acceptable method", whether or not it is in the list we offered
+        for offered in [[AuthenticationMethod.noneRequired], [.noneRequired, .noneAcceptable]] {
+            var none = try self.clientStateMachineAwaitingMethod(offering: offered)
+            var noneSelection = ByteBuffer(bytes: [0x05, 0xFF])
+            XCTAssertThrowsError(try none.receiveBuffer(&noneSelection)) {
+                XCTAssertTrue($0 is SOCKSError.NoValidAuthenticationMethod)
+            }
         }
     }
 
@@ -172,11 +175,32 @@ public class UsernamePasswordStateMachineTests: XCTestCase {
             XCTAssertEqual($0 as? SOCKSError.InvalidSubnegotiationVersion, .init(actual: 0x05))
         }
 
+        // empty fields are the server's business, not a protocol error
         var emptyUsername = try authenticatingServer()
         var emptyUsernameBytes = ByteBuffer(bytes: [0x01, 0x00, 0x01, 0x62])
-        XCTAssertThrowsError(try emptyUsername.receiveBuffer(&emptyUsernameBytes)) {
-            XCTAssertEqual($0 as? SOCKSError.InvalidCredentialLength, .init(field: .username, actual: 0))
+        guard case .authenticationData(let framed)? = try emptyUsername.receiveBuffer(&emptyUsernameBytes) else {
+            return XCTFail("Expected the authentication data")
         }
+        XCTAssertEqual(framed, ByteBuffer(bytes: [0x01, 0x00, 0x01, 0x62]))
+    }
+
+    func testServerSurfacesNonUTF8RequestWithoutTrapping() throws {
+        var stateMachine = ServerStateMachine()
+        try stateMachine.connectionEstablished()
+        var greeting = ByteBuffer(bytes: [0x05, 0x01, 0x02])
+        _ = try stateMachine.receiveBuffer(&greeting)
+        try stateMachine.sendAuthenticationMethod(.init(method: .usernamePassword))
+
+        let wire: [UInt8] = [0x01, 0xFF] + [UInt8](repeating: 0xFF, count: 255) + [0x01, 0x61]
+        var buffer = ByteBuffer(bytes: wire)
+        guard case .authenticationData(var framed)? = try stateMachine.receiveBuffer(&buffer) else {
+            return XCTFail("Expected the authentication data")
+        }
+        XCTAssertEqual(framed, ByteBuffer(bytes: wire))
+        let request = try XCTUnwrap(try framed.readUsernamePasswordRequest())
+        var again = ByteBuffer()
+        again.writeUsernamePasswordRequest(request)
+        XCTAssertEqual(again, ByteBuffer(bytes: wire))
     }
 
     func testServerCannotContinueAfterReportingFailure() throws {
@@ -249,6 +273,7 @@ private final class TestSOCKSServer: ChannelInboundHandler {
 
 public class UsernamePasswordHandlerTests: XCTestCase {
 
+    private var lastHandler: SOCKSClientHandler?
     private let address = SOCKSAddress.address(try! .init(ipAddress: "192.168.1.1", port: 80))
     private let connectRequest: [UInt8] = [0x05, 0x01, 0x00, 0x01, 192, 168, 1, 1, 0x00, 0x50]
     private let connectResponse: [UInt8] = [0x05, 0x00, 0x00, 0x01, 192, 168, 1, 1, 0x00, 0x50]
@@ -258,9 +283,9 @@ public class UsernamePasswordHandlerTests: XCTestCase {
     ) throws -> (EmbeddedChannel, ErrorRecorder) {
         let channel = EmbeddedChannel()
         let errors = ErrorRecorder()
-        try channel.pipeline.syncOperations.addHandler(
-            SOCKSClientHandler(targetAddress: self.address, credentials: credentials)
-        )
+        let handler = SOCKSClientHandler(targetAddress: self.address, credentials: credentials)
+        self.lastHandler = handler
+        try channel.pipeline.syncOperations.addHandler(handler)
         try channel.pipeline.syncOperations.addHandler(errors)
         try channel.connect(to: .init(ipAddress: "127.0.0.1", port: 1080)).wait()
         return (channel, errors)
@@ -378,7 +403,7 @@ public class UsernamePasswordHandlerTests: XCTestCase {
             _ = try self.readOutbound(channel)
             try self.write([0x05, 0xFF], to: channel)
             XCTAssertEqual(errors.errors.count, 1)
-            XCTAssertTrue(errors.errors.first is SOCKSError.InvalidAuthenticationSelection)
+            XCTAssertTrue(errors.errors.first is SOCKSError.NoValidAuthenticationMethod)
             XCTAssertFalse(channel.isActive)
             XCTAssertNil(try self.readOutbound(channel))
         }
@@ -544,5 +569,203 @@ public class UsernamePasswordHandlerTests: XCTestCase {
         XCTAssertTrue(errors.errors.isEmpty)
         XCTAssertEqual(logic.receivedCredentials, [try self.credentials()])
         XCTAssertEqual(logic.receivedRequests.count, 1)
+    }
+
+    // MARK: More client behavior
+
+    func testClientEmptyPasswordWire() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials("alice", ""))
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), [0x01, 5] + Array("alice".utf8) + [0])
+        try self.write([0x01, 0x00], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.connectRequest)
+        XCTAssertTrue(errors.errors.isEmpty)
+    }
+
+    func testClientNonASCIICredentialsAreSentAsUTF8() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials("\u{e9}", "\u{f1}"))
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), [0x01, 0x02, 0xC3, 0xA9, 0x02, 0xC3, 0xB1])
+        try self.write([0x01, 0x00], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.connectRequest)
+        XCTAssertTrue(errors.errors.isEmpty)
+    }
+
+    func testClientAnyNonZeroStatusIsAFailure() throws {
+        for status: UInt8 in [0x01, 0x7F, 0xFF] {
+            let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+            _ = try self.readOutbound(channel)
+            try self.write([0x05, 0x02], to: channel)
+            _ = try self.readOutbound(channel)
+            try self.write([0x01, status], to: channel)
+            XCTAssertEqual(errors.errors.first as? SOCKSError.AuthenticationFailed, .init(status: status))
+            XCTAssertFalse(channel.isActive)
+            XCTAssertNil(try self.readOutbound(channel))
+        }
+    }
+
+    func testHandlerRemovalRequestedDuringAuthenticationSucceeds() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        let handler = try XCTUnwrap(self.lastHandler)
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.aliceRequest)
+
+        // removal is requested while we wait for the status, the handler has to stay until the proxy is up
+        let removal = channel.eventLoop.makePromise(of: Void.self)
+        channel.pipeline.syncOperations.removeHandler(handler, promise: removal)
+        XCTAssertNoThrow(try channel.pipeline.syncOperations.handler(type: SOCKSClientHandler.self))
+
+        try self.write([0x01, 0x00], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.connectRequest)
+        XCTAssertNoThrow(try channel.pipeline.syncOperations.handler(type: SOCKSClientHandler.self))
+
+        try self.write(self.connectResponse + [9], to: channel)
+        XCTAssertNoThrow(try removal.futureResult.wait())
+        XCTAssertThrowsError(try channel.pipeline.syncOperations.handler(type: SOCKSClientHandler.self))
+        XCTAssertEqual(try channel.readInbound(as: ByteBuffer.self), ByteBuffer(bytes: [9]))
+        XCTAssertTrue(errors.errors.isEmpty)
+        XCTAssertTrue(channel.isActive)
+    }
+
+    func testHandlerRemovalRequestedDuringAuthenticationFails() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        let handler = try XCTUnwrap(self.lastHandler)
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        _ = try self.readOutbound(channel)
+
+        let removal = channel.eventLoop.makePromise(of: Void.self)
+        channel.pipeline.syncOperations.removeHandler(handler, promise: removal)
+
+        try self.write([0x01, 0x01], to: channel)
+        XCTAssertEqual(errors.errors.first as? SOCKSError.AuthenticationFailed, .init(status: 0x01))
+        XCTAssertFalse(channel.isActive)
+        XCTAssertNil(try self.readOutbound(channel))
+        // Note: like after a failed connect request, the handler only completes a pending removal once
+        // the proxy is established, so `removal` is intentionally not awaited here.
+    }
+
+    func testWritesDuringAuthenticationAreFlushedInOrderAfterEstablishment() throws {
+        let (channel, _) = try self.makeClient(credentials: try self.credentials())
+        let first = channel.eventLoop.makePromise(of: Void.self)
+        let second = channel.eventLoop.makePromise(of: Void.self)
+        channel.write(ByteBuffer(bytes: [1, 2, 3]), promise: first)
+        channel.flush()
+        channel.write(ByteBuffer(bytes: [4, 5, 6]), promise: second)
+
+        XCTAssertEqual(try self.readOutbound(channel), [0x05, 0x02, 0x00, 0x02])
+        try self.write([0x05, 0x02], to: channel)
+        // only the credentials, never application data, before the tunnel exists
+        XCTAssertEqual(try self.readOutbound(channel), self.aliceRequest)
+        XCTAssertNil(try self.readOutbound(channel))
+        try self.write([0x01, 0x00], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.connectRequest)
+        XCTAssertNil(try self.readOutbound(channel))
+
+        try self.write(self.connectResponse, to: channel)
+        XCTAssertNoThrow(try first.futureResult.wait())
+        XCTAssertEqual(try self.readOutbound(channel), [1, 2, 3])
+        // the second write was not flushed yet
+        XCTAssertNil(try self.readOutbound(channel))
+        channel.flush()
+        XCTAssertNoThrow(try second.futureResult.wait())
+        XCTAssertEqual(try self.readOutbound(channel), [4, 5, 6])
+    }
+
+    func testWritesFailedAuthenticationNeverReachTheNetwork() throws {
+        let (channel, _) = try self.makeClient(credentials: try self.credentials())
+        channel.writeAndFlush(ByteBuffer(bytes: [1, 2, 3]), promise: nil)
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        _ = try self.readOutbound(channel)
+        try self.write([0x01, 0x01], to: channel)
+        XCTAssertNil(try self.readOutbound(channel))
+    }
+
+    func testDumpOfTheHandlerDoesNotLeakThePassword() throws {
+        let handler = SOCKSClientHandler(
+            targetAddress: self.address,
+            credentials: try self.credentials("alice", "hunter2")
+        )
+        var text = ""
+        dump(handler, to: &text)
+        XCTAssertTrue(text.contains("alice"), text)
+        XCTAssertFalse(text.contains("hunter2"), text)
+        XCTAssertFalse(text.contains("104"), text)
+        XCTAssertTrue(text.contains("<redacted>"), text)
+
+        // also once the handshake is running
+        let (channel, _) = try self.makeClient(credentials: try self.credentials("alice", "hunter2"))
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        var running = ""
+        dump(try XCTUnwrap(self.lastHandler), to: &running)
+        XCTAssertFalse(running.contains("hunter2"), running)
+    }
+
+    // MARK: More client <-> server
+
+    func testEndToEndEmptyPassword() throws {
+        let credentials = try self.credentials("alice", "")
+        let (server, logic) = try self.makeServer(method: .usernamePassword, expected: credentials)
+        let (client, errors) = try self.makeClient(credentials: credentials)
+        try self.pump(client, server)
+
+        XCTAssertTrue(errors.errors.isEmpty)
+        XCTAssertEqual(logic.receivedCredentials, [credentials])
+        XCTAssertEqual(logic.receivedRequests.count, 1)
+    }
+
+    func testEndToEndNonASCII() throws {
+        let credentials = try self.credentials("\u{e9}", "\u{f1}\u{1F600}")
+        let (server, logic) = try self.makeServer(method: .usernamePassword, expected: credentials)
+        let (client, errors) = try self.makeClient(credentials: credentials)
+        try self.pump(client, server)
+
+        XCTAssertTrue(errors.errors.isEmpty)
+        XCTAssertEqual(logic.receivedCredentials, [credentials])
+        XCTAssertEqual(logic.receivedRequests.count, 1)
+    }
+
+    func testServerHandlerAcceptsEmptyUsernameAndPasswordOnTheWire() throws {
+        for (wire, username, password) in [
+            ([UInt8]([0x01, 0x00, 0x01, 0x62]), [UInt8](), [UInt8]([0x62])),
+            ([0x01, 0x01, 0x61, 0x00], [0x61], []),
+            ([0x01, 0x00, 0x00], [], []),
+        ] {
+            let (server, logic) = try self.makeServer(method: .usernamePassword, expected: try self.credentials())
+            try self.write([0x05, 0x01, 0x02], to: server)
+            XCTAssertEqual(try self.readOutbound(server), [0x05, 0x02])
+
+            // a server can reject them with a failure status, not by dropping the connection
+            try self.write(wire, to: server)
+            XCTAssertEqual(logic.receivedCredentials.count, 1)
+            XCTAssertEqual(logic.receivedCredentials.first?.usernameBytes, username)
+            XCTAssertEqual(logic.receivedCredentials.first?.passwordBytes, password)
+            XCTAssertEqual(try self.readOutbound(server), [0x01, 0x01])
+            XCTAssertTrue(server.isActive)
+        }
+    }
+
+    func testServerHandlerWithHostileNonUTF8Credentials() throws {
+        let (server, logic) = try self.makeServer(method: .usernamePassword, expected: try self.credentials())
+        try self.write([0x05, 0x01, 0x02], to: server)
+        _ = try self.readOutbound(server)
+
+        let wire: [UInt8] = [0x01, 0xFF] + [UInt8](repeating: 0xFF, count: 255) + [0x01, 0x61]
+        try self.write(wire, to: server)
+        XCTAssertEqual(logic.receivedCredentials.count, 1)
+        XCTAssertEqual(logic.receivedCredentials.first?.usernameBytes, [UInt8](repeating: 0xFF, count: 255))
+        XCTAssertEqual(try self.readOutbound(server), [0x01, 0x01])
+
+        // and the same bytes with another byte value are different credentials
+        let (other, otherLogic) = try self.makeServer(method: .usernamePassword, expected: try self.credentials())
+        try self.write([0x05, 0x01, 0x02], to: other)
+        _ = try self.readOutbound(other)
+        try self.write([0x01, 0xFF] + [UInt8](repeating: 0xFE, count: 255) + [0x01, 0x61], to: other)
+        XCTAssertNotEqual(otherLogic.receivedCredentials, logic.receivedCredentials)
     }
 }
