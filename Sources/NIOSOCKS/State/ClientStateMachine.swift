@@ -103,6 +103,10 @@ extension ClientStateMachine {
             guard let selected = try buffer.readMethodSelection() else {
                 return nil
             }
+            // RFC 1928: the server has no acceptable method, the connection has to be closed.
+            guard selected.method != .noneAcceptable else {
+                throw SOCKSError.NoValidAuthenticationMethod()
+            }
             guard greeting.methods.contains(selected.method) else {
                 throw SOCKSError.InvalidAuthenticationSelection(selection: selected.method)
             }
