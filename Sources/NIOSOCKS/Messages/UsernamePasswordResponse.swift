@@ -14,7 +14,7 @@
 
 import NIOCore
 
-/// The server's answer to a UsernamePasswordRequest, as defined by RFC 1929.
+/// The server's answer to a ``UsernamePasswordRequest``, as defined by RFC 1929.
 /// On the wire this is `VER (0x01) | STATUS`.
 public struct UsernamePasswordResponse: Hashable, Sendable {
 
@@ -34,7 +34,7 @@ public struct UsernamePasswordResponse: Hashable, Sendable {
     /// A response indicating that the credentials were rejected.
     public static let failure = UsernamePasswordResponse(status: 0x01)
 
-    /// Creates a new UsernamePasswordResponse.
+    /// Creates a new ``UsernamePasswordResponse``.
     /// - parameter status: *0* if the credentials were accepted, any other value if they were rejected.
     public init(status: UInt8) {
         self.status = status
@@ -43,11 +43,11 @@ public struct UsernamePasswordResponse: Hashable, Sendable {
 
 extension ByteBuffer {
 
-    /// Attempts to read a UsernamePasswordResponse (RFC 1929) from the buffer.
+    /// Attempts to read a ``UsernamePasswordResponse`` (RFC 1929) from the buffer.
     ///
     /// If the buffer does not yet contain a complete response nothing is consumed and `nil` is returned.
     ///
-    /// - throws: SOCKSError/InvalidSubnegotiationVersion if the version is not *1*.
+    /// - throws: ``SOCKSError/InvalidSubnegotiationVersion`` if the version is not *1*.
     public mutating func readUsernamePasswordResponse() throws -> UsernamePasswordResponse? {
         try self.parseUnwindingIfNeeded { buffer -> UsernamePasswordResponse? in
             guard
@@ -60,7 +60,7 @@ extension ByteBuffer {
         }
     }
 
-    /// Writes a UsernamePasswordResponse (RFC 1929) to the buffer.
+    /// Writes a ``UsernamePasswordResponse`` (RFC 1929) to the buffer.
     /// - returns: The number of bytes written.
     @discardableResult
     public mutating func writeUsernamePasswordResponse(_ response: UsernamePasswordResponse) -> Int {

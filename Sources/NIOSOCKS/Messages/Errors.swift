@@ -110,7 +110,8 @@ public enum SOCKSError: Sendable {
         }
     }
 
-    /// A username or password is empty, or longer than the 255 bytes RFC 1929 can encode.
+    /// A username is empty, or a username or password is longer than the 255 bytes RFC 1929 can encode.
+    /// (An empty password is allowed.)
     public struct InvalidCredentialLength: Error, Hashable {
         /// The part of the credentials that has an invalid length.
         public enum Field: Hashable, Sendable {

@@ -16,7 +16,7 @@ import NIOCore
 
 /// The first message of the username/password sub-negotiation defined in RFC 1929.
 ///
-/// Sent by the client once the server selected AuthenticationMethod/usernamePassword.
+/// Sent by the client once the server selected ``AuthenticationMethod/usernamePassword``.
 /// On the wire this is `VER (0x01) | ULEN | UNAME | PLEN | PASSWD`.
 public struct UsernamePasswordRequest: Hashable, Sendable {
 
@@ -27,20 +27,22 @@ public struct UsernamePasswordRequest: Hashable, Sendable {
     /// The credentials to authenticate with.
     public var credentials: UsernamePasswordCredentials
 
-    /// The username to authenticate with.
+    /// The username to authenticate with, decoded as UTF-8. See ``UsernamePasswordCredentials/usernameBytes``
+    /// for the exact bytes.
     public var username: String { self.credentials.username }
 
-    /// The password to authenticate with.
+    /// The password to authenticate with, decoded as UTF-8. See ``UsernamePasswordCredentials/passwordBytes``
+    /// for the exact bytes.
     public var password: String { self.credentials.password }
 
-    /// Creates a new UsernamePasswordRequest.
+    /// Creates a new ``UsernamePasswordRequest``.
     /// - parameter credentials: The credentials to authenticate with.
     public init(credentials: UsernamePasswordCredentials) {
         self.credentials = credentials
     }
 }
 
-extension UsernamePasswordRequest: CustomStringConvertible, CustomDebugStringConvertible {
+extension UsernamePasswordRequest: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public var description: String {
         "UsernamePasswordRequest(\(self.credentials.description))"
     }
@@ -48,60 +50,63 @@ extension UsernamePasswordRequest: CustomStringConvertible, CustomDebugStringCon
     public var debugDescription: String {
         self.description
     }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["credentials": self.credentials], displayStyle: .struct)
+    }
 }
 
 extension ByteBuffer {
 
-    /// Attempts to read a UsernamePasswordRequest (RFC 1929) from the buffer.
+    /// Attempts to read a ``UsernamePasswordRequest`` (RFC 1929) from the buffer.
     ///
     /// If the buffer does not yet contain a complete request nothing is consumed and `nil` is returned.
-    /// The username and the password are decoded as UTF-8, invalid sequences are replaced
-    /// with U+FFFD.
+    /// The username and the password are kept as the exact bytes that were sent, they are not required
+    /// to be valid UTF-8, see ``UsernamePasswordCredentials/usernameBytes``.
     ///
-    /// - throws: SOCKSError/InvalidSubnegotiationVersion if the version is not *1*, or
-    ///   SOCKSError/InvalidCredentialLength if the username or the password is empty.
+    /// RFC 1929 says that the username and the password have at least one byte, this method is deliberately
+    /// lenient and also accepts empty values: whether such credentials are acceptable is the server's decision,
+    /// and a server should be able to answer a request with empty fields with a failure status
+    /// rather than see a protocol error and have to drop the connection. (Real clients do send an empty password.)
+    ///
+    /// - throws: ``SOCKSError/InvalidSubnegotiationVersion`` if the version is not *1*.
     public mutating func readUsernamePasswordRequest() throws -> UsernamePasswordRequest? {
         try self.parseUnwindingIfNeeded { buffer -> UsernamePasswordRequest? in
             guard try buffer.readAndValidateSubnegotiationVersion() != nil else {
                 return nil
             }
-            guard let username = try buffer.readLengthPrefixedCredential(field: .username),
-                let password = try buffer.readLengthPrefixedCredential(field: .password)
+            guard let username = buffer.readLengthPrefixedBytes(),
+                let password = buffer.readLengthPrefixedBytes()
             else {
                 return nil
             }
-            return .init(
-                credentials: .init(
-                    validatedUsername: String(decoding: username, as: UTF8.self),
-                    password: String(decoding: password, as: UTF8.self)
-                )
-            )
+            return .init(credentials: .init(wireUsername: username, wirePassword: password))
         }
     }
 
-    /// Writes a UsernamePasswordRequest (RFC 1929) to the buffer.
+    /// Writes a ``UsernamePasswordRequest`` (RFC 1929) to the buffer.
     /// - returns: The number of bytes written.
     @discardableResult
     public mutating func writeUsernamePasswordRequest(_ request: UsernamePasswordRequest) -> Int {
-        // The lengths are guaranteed to fit into a byte by `UsernamePasswordCredentials`.
         var written = self.writeInteger(request.version)
-        written += self.writeInteger(UInt8(request.username.utf8.count))
-        written += self.writeString(request.username)
-        written += self.writeInteger(UInt8(request.password.utf8.count))
-        written += self.writeString(request.password)
+        written += self.writeLengthPrefixedBytes(request.credentials.usernameBytes)
+        written += self.writeLengthPrefixedBytes(request.credentials.passwordBytes)
         return written
     }
 
-    private mutating func readLengthPrefixedCredential(
-        field: SOCKSError.InvalidCredentialLength.Field
-    ) throws -> [UInt8]? {
+    private mutating func readLengthPrefixedBytes() -> [UInt8]? {
         guard let length = self.readInteger(as: UInt8.self) else {
             return nil
         }
-        guard length >= UsernamePasswordCredentials.minimumFieldLength else {
-            throw SOCKSError.InvalidCredentialLength(field: field, actual: Int(length))
-        }
         return self.readBytes(length: Int(length))
+    }
+
+    private mutating func writeLengthPrefixedBytes(_ bytes: [UInt8]) -> Int {
+        // The initializers of UsernamePasswordCredentials never let more than 255 bytes in.
+        guard let length = UInt8(exactly: bytes.count) else {
+            preconditionFailure("UsernamePasswordCredentials fields are at most 255 bytes long")
+        }
+        return self.writeInteger(length) + self.writeBytes(bytes)
     }
 
 }
