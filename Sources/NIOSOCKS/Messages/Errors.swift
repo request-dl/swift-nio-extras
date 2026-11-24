@@ -95,6 +95,9 @@ public enum SOCKSError: Sendable {
 
     /// The server rejected the username and password (RFC 1929). Any status other than *0*
     /// is a rejection.
+    ///
+    /// A server that closes the connection after it received the credentials, without sending a status,
+    /// is a rejection too. In that case `status` is `0xFF`, as no status was received.
     public struct AuthenticationFailed: Error, Hashable {
         public var status: UInt8
         public init(status: UInt8) {
