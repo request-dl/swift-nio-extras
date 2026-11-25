@@ -52,7 +52,8 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
     /// ``AuthenticationMethod/noneRequired`` and ``AuthenticationMethod/usernamePassword``
     /// to the server, and only sends the credentials if the server selects the latter.
     /// If the server rejects them the handler fires ``SOCKSError/AuthenticationFailed``
-    /// and closes the channel. Without credentials (`nil`) the handler behaves exactly like
+    /// and closes the channel. A server that closes the connection after it received the credentials,
+    /// without sending a status, counts as a rejection too (see ``SOCKSError/AuthenticationFailed``). Without credentials (`nil`) the handler behaves exactly like
     /// ``init(targetAddress:)`` and only offers ``AuthenticationMethod/noneRequired``.
     ///
     /// - important: The credentials are sent in clear text. Only use this over a connection you trust.
@@ -81,6 +82,17 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
     /// - Parameter context: Calling context.
     public func handlerAdded(context: ChannelHandlerContext) {
         self.beginHandshake(context: context)
+    }
+
+    public func channelInactive(context: ChannelHandlerContext) {
+        // A server that closes the connection after it received the credentials, without sending
+        // the status, is reported as a rejection before the channel is reported inactive.
+        do {
+            try self.state.channelInactive()
+        } catch {
+            context.fireErrorCaught(error)
+        }
+        context.fireChannelInactive()
     }
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {

@@ -95,6 +95,23 @@ extension ClientStateMachine {
         }
     }
 
+    /// The status reported in ``SOCKSError/AuthenticationFailed`` when the server closed the connection
+    /// before it answered the credentials. RFC 1929 only defines `0x00` for success and says any other value
+    /// is a failure, so a status that was never sent is reported as `0xFF`.
+    static let statusWhenConnectionClosed: UInt8 = 0xFF
+
+    /// The connection was closed by the peer. A server that closes the connection after it received the
+    /// credentials, without sending the status, has not accepted them: report it as a rejection, the same way
+    /// as a status other than *0*. Otherwise the caller sees a plain closed connection and has no way to tell
+    /// it from a network failure that is worth retrying with the same credentials.
+    mutating func channelInactive() throws {
+        guard self.state == .waitingForCredentialsResponse else {
+            return
+        }
+        self.state = .error
+        throw SOCKSError.AuthenticationFailed(status: Self.statusWhenConnectionClosed)
+    }
+
     mutating func handleSelectedAuthenticationMethod(
         _ buffer: inout ByteBuffer,
         greeting: ClientGreeting

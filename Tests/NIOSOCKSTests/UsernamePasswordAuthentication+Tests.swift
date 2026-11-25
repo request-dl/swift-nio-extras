@@ -86,6 +86,43 @@ public class UsernamePasswordStateMachineTests: XCTestCase {
         }
     }
 
+    func testClientConnectionClosedWhileWaitingForTheCredentialsResponse() throws {
+        var stateMachine = try self.clientStateMachineAwaitingMethod(offering: [.usernamePassword])
+        var selection = ByteBuffer(bytes: [0x05, 0x02])
+        XCTAssertEqual(try stateMachine.receiveBuffer(&selection), .sendCredentials)
+        try stateMachine.sendClientCredentials()
+
+        XCTAssertThrowsError(try stateMachine.channelInactive()) {
+            XCTAssertEqual($0 as? SOCKSError.AuthenticationFailed, .init(status: 0xFF))
+        }
+        XCTAssertFalse(stateMachine.proxyEstablished)
+        // it is reported once
+        XCTAssertNoThrow(try stateMachine.channelInactive())
+    }
+
+    func testClientConnectionClosedInOtherStatesIsNotAnAuthenticationFailure() throws {
+        var inactive = ClientStateMachine()
+        XCTAssertNoThrow(try inactive.channelInactive())
+
+        var awaitingMethod = try self.clientStateMachineAwaitingMethod(offering: [.usernamePassword])
+        XCTAssertNoThrow(try awaitingMethod.channelInactive())
+
+        // the server selected the method, the credentials are not sent yet
+        var awaitingToSend = try self.clientStateMachineAwaitingMethod(offering: [.usernamePassword])
+        var selection = ByteBuffer(bytes: [0x05, 0x02])
+        XCTAssertEqual(try awaitingToSend.receiveBuffer(&selection), .sendCredentials)
+        XCTAssertNoThrow(try awaitingToSend.channelInactive())
+
+        // the credentials were accepted
+        var accepted = try self.clientStateMachineAwaitingMethod(offering: [.usernamePassword])
+        var selection2 = ByteBuffer(bytes: [0x05, 0x02])
+        XCTAssertEqual(try accepted.receiveBuffer(&selection2), .sendCredentials)
+        try accepted.sendClientCredentials()
+        var status = ByteBuffer(bytes: [0x01, 0x00])
+        XCTAssertEqual(try accepted.receiveBuffer(&status), .sendRequest)
+        XCTAssertNoThrow(try accepted.channelInactive())
+    }
+
     func testClientRejectsBadSubnegotiationVersion() throws {
         var stateMachine = try self.clientStateMachineAwaitingMethod(offering: [.usernamePassword])
         var selection = ByteBuffer(bytes: [0x05, 0x02])
@@ -226,9 +263,16 @@ public class UsernamePasswordStateMachineTests: XCTestCase {
 private final class ErrorRecorder: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
     var errors: [Error] = []
+    /// How many errors had been caught when `channelInactive` arrived, `nil` if it never did.
+    var errorCountAtChannelInactive: Int?
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         self.errors.append(error)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        self.errorCountAtChannelInactive = self.errors.count
+        context.fireChannelInactive()
     }
 }
 
@@ -372,6 +416,68 @@ public class UsernamePasswordHandlerTests: XCTestCase {
         XCTAssertFalse(channel.isActive)
         // the connect request must never be sent after a failed authentication
         XCTAssertNil(try self.readOutbound(channel))
+    }
+
+    func testClientServerClosesWithoutStatusAfterCredentials() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        XCTAssertEqual(try self.readOutbound(channel), self.aliceRequest)
+
+        // the server closes the socket instead of answering with a status
+        channel.pipeline.fireChannelInactive()
+        XCTAssertEqual(errors.errors.count, 1)
+        XCTAssertEqual(errors.errors.first as? SOCKSError.AuthenticationFailed, .init(status: 0xFF))
+        // the failure is reported before the channel is reported inactive
+        XCTAssertEqual(errors.errorCountAtChannelInactive, 1)
+        XCTAssertNil(try self.readOutbound(channel))
+    }
+
+    func testClientServerClosesAfterPartialStatusAfterCredentials() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        _ = try self.readOutbound(channel)
+        try self.write([0x01], to: channel)
+        XCTAssertTrue(errors.errors.isEmpty)
+
+        channel.pipeline.fireChannelInactive()
+        XCTAssertEqual(errors.errors.first as? SOCKSError.AuthenticationFailed, .init(status: 0xFF))
+        XCTAssertEqual(errors.errorCountAtChannelInactive, 1)
+    }
+
+    func testClientRejectedCredentialsAreReportedOnlyOnceWhenTheServerCloses() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        _ = try self.readOutbound(channel)
+        try self.write([0x01, 0x01], to: channel)
+
+        channel.pipeline.fireChannelInactive()
+        XCTAssertEqual(errors.errors.count, 1)
+        XCTAssertEqual(errors.errors.first as? SOCKSError.AuthenticationFailed, .init(status: 0x01))
+    }
+
+    func testClientServerClosesBeforeTheCredentialsAreSent() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        _ = try self.readOutbound(channel)
+
+        channel.pipeline.fireChannelInactive()
+        XCTAssertTrue(errors.errors.isEmpty)
+        XCTAssertEqual(errors.errorCountAtChannelInactive, 0)
+    }
+
+    func testClientEstablishedTunnelClosingIsNotAnError() throws {
+        let (channel, errors) = try self.makeClient(credentials: try self.credentials())
+        _ = try self.readOutbound(channel)
+        try self.write([0x05, 0x02], to: channel)
+        _ = try self.readOutbound(channel)
+        try self.write([0x01, 0x00], to: channel)
+        _ = try self.readOutbound(channel)
+        try self.write(self.connectResponse, to: channel)
+
+        channel.pipeline.fireChannelInactive()
+        XCTAssertTrue(errors.errors.isEmpty)
     }
 
     func testClientServerSelectsMethodNotOffered() throws {
