@@ -200,7 +200,7 @@ extension SOCKSClientHandler {
         try self.state.sendClientCredentials()
 
         // [version, ulen, username, plen, password]
-        let capacity = 3 + credentials.username.utf8.count + credentials.password.utf8.count
+        let capacity = 3 + credentials.usernameBytes.count + credentials.passwordBytes.count
         var buffer = context.channel.allocator.buffer(capacity: capacity)
         buffer.writeUsernamePasswordRequest(request)
         context.writeAndFlush(self.wrapOutboundOut(buffer), promise: nil)
