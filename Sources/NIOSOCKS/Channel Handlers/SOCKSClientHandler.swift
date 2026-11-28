@@ -29,6 +29,7 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
     public typealias OutboundOut = ByteBuffer
 
     private let targetAddress: SOCKSAddress
+    private let credentials: UsernamePasswordCredentials?
 
     private var state: ClientStateMachine
     private var removalToken: ChannelHandlerContext.RemovalToken?
@@ -39,7 +40,26 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
     /// Creates a new ``SOCKSClientHandler`` that connects to a server
     /// and instructs the server to connect to `targetAddress`.
     /// - parameter targetAddress: The desired end point - note that only IPv4, IPv6, and FQDNs are supported.
-    public init(targetAddress: SOCKSAddress) {
+    public convenience init(targetAddress: SOCKSAddress) {
+        self.init(targetAddress: targetAddress, credentials: nil)
+    }
+
+    /// Creates a new ``SOCKSClientHandler`` that connects to a server
+    /// and instructs the server to connect to `targetAddress`, authenticating
+    /// with a username and password (RFC 1929) if the server asks for it.
+    ///
+    /// When `credentials` are provided the handler offers both
+    /// ``AuthenticationMethod/noneRequired`` and ``AuthenticationMethod/usernamePassword``
+    /// to the server, and only sends the credentials if the server selects the latter.
+    /// If the server rejects them the handler fires ``SOCKSError/AuthenticationFailed``
+    /// and closes the channel. A server that closes the connection after it received the credentials,
+    /// without sending a status, counts as a rejection too (see ``SOCKSError/AuthenticationFailed``). Without credentials (`nil`) the handler behaves exactly like
+    /// ``init(targetAddress:)`` and only offers ``AuthenticationMethod/noneRequired``.
+    ///
+    /// - important: The credentials are sent in clear text. Only use this over a connection you trust.
+    /// - parameter targetAddress: The desired end point - note that only IPv4, IPv6, and FQDNs are supported.
+    /// - parameter credentials: The username and password to authenticate with, if the server requires it.
+    public init(targetAddress: SOCKSAddress, credentials: UsernamePasswordCredentials?) {
 
         switch targetAddress {
         case .address(.unixDomainSocket):
@@ -50,6 +70,7 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
 
         self.state = ClientStateMachine()
         self.targetAddress = targetAddress
+        self.credentials = credentials
     }
 
     public func channelActive(context: ChannelHandlerContext) {
@@ -61,6 +82,17 @@ public final class SOCKSClientHandler: ChannelDuplexHandler {
     /// - Parameter context: Calling context.
     public func handlerAdded(context: ChannelHandlerContext) {
         self.beginHandshake(context: context)
+    }
+
+    public func channelInactive(context: ChannelHandlerContext) {
+        // A server that closes the connection after it received the credentials, without sending
+        // the status, is reported as a rejection before the channel is reported inactive.
+        do {
+            try self.state.channelInactive()
+        } catch {
+            context.fireErrorCaught(error)
+        }
+        context.fireChannelInactive()
     }
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -138,6 +170,8 @@ extension SOCKSClientHandler {
             break  // do nothing, we've already buffered the data
         case .sendGreeting:
             try self.handleActionSendClientGreeting(context: context)
+        case .sendCredentials:
+            try self.handleActionSendCredentials(context: context)
         case .sendRequest:
             try self.handleActionSendRequest(context: context)
         case .proxyEstablished:
@@ -146,11 +180,29 @@ extension SOCKSClientHandler {
     }
 
     private func handleActionSendClientGreeting(context: ChannelHandlerContext) throws {
-        let greeting = ClientGreeting(methods: [.noneRequired])  // no authentication currently supported
-        let capacity = 3  // [version, #methods, methods...]
+        // username/password is only offered when we actually have credentials to send
+        let methods: [AuthenticationMethod] =
+            self.credentials == nil ? [.noneRequired] : [.noneRequired, .usernamePassword]
+        let greeting = ClientGreeting(methods: methods)
+        let capacity = 2 + methods.count  // [version, #methods, methods...]
         var buffer = context.channel.allocator.buffer(capacity: capacity)
         buffer.writeClientGreeting(greeting)
         try self.state.sendClientGreeting(greeting)
+        context.writeAndFlush(self.wrapOutboundOut(buffer), promise: nil)
+    }
+
+    private func handleActionSendCredentials(context: ChannelHandlerContext) throws {
+        // the state machine only asks for credentials if they were offered in the greeting
+        guard let credentials = self.credentials else {
+            throw SOCKSError.InvalidClientState()
+        }
+        let request = UsernamePasswordRequest(credentials: credentials)
+        try self.state.sendClientCredentials()
+
+        // [version, ulen, username, plen, password]
+        let capacity = 3 + credentials.usernameBytes.count + credentials.passwordBytes.count
+        var buffer = context.channel.allocator.buffer(capacity: capacity)
+        buffer.writeUsernamePasswordRequest(request)
         context.writeAndFlush(self.wrapOutboundOut(buffer), promise: nil)
     }
 
